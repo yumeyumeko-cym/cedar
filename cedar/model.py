@@ -13,7 +13,7 @@ from torch.utils.data import Sampler
 
 
 class LabelAwareBatchSampler(Sampler[List[int]]):
-    """Ensure every batch provides multiple samples per label for contrastive learning."""
+    """Ensure every batch provides multiple samples per weak label for contrastive learning."""
 
     def __init__(self,
                  labels: np.ndarray,
