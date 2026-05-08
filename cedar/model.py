@@ -1,74 +1,13 @@
-"""Encoder and label-aware batch sampler for CEDAR."""
+"""Encoder and weak-label positive-pair sampler for CEDAR."""
 
 from __future__ import annotations
 
-import math
-from typing import List, Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Sampler
-
-
-class LabelAwareBatchSampler(Sampler[List[int]]):
-    """Ensure every batch provides multiple samples per weak label for contrastive learning."""
-
-    def __init__(self,
-                 labels: np.ndarray,
-                 batch_size: int,
-                 num_views: int = 2,
-                 steps_per_epoch: Optional[int] = None,
-                 seed: Optional[int] = None):
-        if batch_size < 1:
-            raise ValueError("batch_size must be positive")
-        if num_views < 1:
-            raise ValueError("num_views must be positive")
-
-        self.labels = np.asarray(labels, dtype=np.int64)
-        if self.labels.size == 0:
-            raise ValueError("labels array must be non-empty")
-
-        self.batch_size = batch_size
-        self.num_views = num_views
-        self.unique_labels = np.unique(self.labels)
-        self.label_to_indices = {
-            label: np.flatnonzero(self.labels == label)
-            for label in self.unique_labels
-        }
-        self.steps_per_epoch = steps_per_epoch or max(1, math.ceil(len(self.labels) / self.batch_size))
-        base_seed = seed if seed is not None else np.random.SeedSequence().entropy
-        self._base_seed = int(base_seed) % (2 ** 32)
-        self._epoch = 0
-
-    def __len__(self) -> int:
-        return self.steps_per_epoch
-
-    def __iter__(self):
-        rng = np.random.default_rng(self._base_seed + self._epoch)
-        self._epoch += 1
-
-        pairs_per_batch = max(1, self.batch_size // self.num_views)
-        for _ in range(self.steps_per_epoch):
-            batch_indices: List[int] = []
-
-            chosen_labels = rng.choice(self.unique_labels, size=pairs_per_batch, replace=True)
-            for label in chosen_labels:
-                indices = self.label_to_indices[label]
-                replace = len(indices) < self.num_views
-                sampled = rng.choice(indices, size=self.num_views, replace=replace)
-                batch_indices.extend(int(idx) for idx in sampled.tolist())
-
-            remainder = self.batch_size - len(batch_indices)
-            if remainder > 0:
-                label = rng.choice(self.unique_labels)
-                indices = self.label_to_indices[label]
-                replace = len(indices) < remainder
-                sampled = rng.choice(indices, size=remainder, replace=replace)
-                batch_indices.extend(int(idx) for idx in sampled.tolist())
-
-            yield batch_indices
 
 
 class CedarEncoder(nn.Module):
@@ -105,3 +44,51 @@ class CedarEncoder(nn.Module):
         pre_z = self.embedding(h)
         z = F.normalize(pre_z, p=2, dim=1, eps=1e-12)
         return z
+
+
+class PositivePairSampler:
+    """Sample dataset indices that share an anchor's weak (edge) label.
+
+    For each anchor, returns ``num_positives`` indices drawn (without replacement
+    when possible) from the set of flows carrying the same edge label, excluding
+    the anchor itself. Anchors whose label has no other member in the dataset
+    are reported as invalid and the loss is expected to skip them.
+    """
+
+    def __init__(self, weak_labels: np.ndarray, num_positives: int, seed: int):
+        if num_positives < 1:
+            raise ValueError("num_positives must be >= 1")
+        self.labels = np.asarray(weak_labels, dtype=np.int64)
+        if self.labels.ndim != 1 or self.labels.size == 0:
+            raise ValueError("weak_labels must be a non-empty 1D array")
+        self.num_positives = int(num_positives)
+        self.label_to_indices = {
+            int(label): np.flatnonzero(self.labels == label)
+            for label in np.unique(self.labels)
+        }
+        self._rng = np.random.default_rng(int(seed))
+
+    def sample(
+        self,
+        anchor_indices: np.ndarray,
+        anchor_labels: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return ``(partner_indices, valid_mask)`` of shapes ``(B, C)`` and ``(B,)``."""
+
+        anchor_indices = np.asarray(anchor_indices, dtype=np.int64)
+        anchor_labels = np.asarray(anchor_labels, dtype=np.int64)
+        batch = anchor_indices.shape[0]
+        partners = np.zeros((batch, self.num_positives), dtype=np.int64)
+        valid = np.ones(batch, dtype=bool)
+
+        for i in range(batch):
+            pool = self.label_to_indices.get(int(anchor_labels[i]))
+            if pool is None or pool.size <= 1:
+                valid[i] = False
+                partners[i] = int(anchor_indices[i])
+                continue
+            candidates = pool[pool != int(anchor_indices[i])]
+            replace = candidates.size < self.num_positives
+            partners[i] = self._rng.choice(candidates, size=self.num_positives, replace=replace)
+
+        return partners, valid

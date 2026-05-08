@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import random
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -13,12 +12,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from .config import CedarConfig
-from .model import LabelAwareBatchSampler
+from .model import PositivePairSampler
 from .scoring import cluster_diagnostics
 
 
 def set_seed(seed: int) -> None:
-    """Seed Python, NumPy, and PyTorch RNGs for reproducibility."""
 
     random.seed(seed)
     np.random.seed(seed)
@@ -27,39 +25,59 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def weak_structure_loss(z: torch.Tensor, weak_labels: torch.Tensor, tau_weak: float) -> torch.Tensor:
-    """Anchor-balanced supervised-contrastive loss induced by weak labels."""
+def pair_supcon_loss(
+    z_anchor: torch.Tensor,
+    z_partners: torch.Tensor,
+    valid: torch.Tensor,
+    tau: float,
+) -> torch.Tensor:
+    """SimCLR-style InfoNCE where each anchor's positives are sampled same-edge partners.
 
-    if z.ndim != 2:
-        raise ValueError("z must be 2D (batch, embedding_dim)")
-    if weak_labels.ndim != 1 or weak_labels.shape[0] != z.shape[0]:
-        raise ValueError("weak_labels must be a 1D tensor aligned with z")
-    if tau_weak <= 0:
-        raise ValueError("tau_weak must be positive")
+    ``z_anchor`` are the batch embeddings ``(B, D)``. ``z_partners`` is shape
+    ``(B, C, D)`` where partner ``c`` of anchor ``i`` was sampled from the full
+    dataset (excluding the anchor itself) by matching weak label. ``valid`` is a
+    bool mask ``(B,)`` flagging anchors whose label has at least one other flow
+    in the dataset; anchors marked invalid are skipped from the loss.
 
-    z = F.normalize(z, p=2, dim=1, eps=1e-12)
-    logits = (z @ z.T) / tau_weak
+    Negatives for anchor ``i`` are every other anchor and every partner that
+    isn't one of anchor ``i``'s sampled positives.
+    """
 
-    batch_size = logits.shape[0]
-    logits_mask = torch.ones((batch_size, batch_size), device=logits.device, dtype=logits.dtype)
-    logits_mask.fill_diagonal_(0.0)
-    logits = logits.masked_fill(logits_mask == 0, float("-inf"))
+    if z_anchor.ndim != 2:
+        raise ValueError("z_anchor must be 2D (B, D)")
+    if z_partners.ndim != 3 or z_partners.shape[0] != z_anchor.shape[0] or z_partners.shape[2] != z_anchor.shape[1]:
+        raise ValueError("z_partners must be (B, C, D) aligned with z_anchor")
+    if tau <= 0:
+        raise ValueError("tau must be positive")
 
-    labels = weak_labels.contiguous().view(-1, 1)
-    positive_mask = torch.eq(labels, labels.T).to(dtype=logits.dtype) * logits_mask
+    B, C, D = z_partners.shape
+    z_anchor = F.normalize(z_anchor, p=2, dim=1, eps=1e-12)
+    z_partners = F.normalize(z_partners, p=2, dim=2, eps=1e-12)
 
+    keys = torch.cat([z_anchor, z_partners.reshape(B * C, D)], dim=0)  # (B + B*C, D)
+    logits = (z_anchor @ keys.T) / tau  # (B, B + B*C)
+
+    self_mask = torch.zeros_like(logits, dtype=torch.bool)
+    self_idx = torch.arange(B, device=logits.device)
+    self_mask[self_idx, self_idx] = True
+
+    pos_mask = torch.zeros_like(logits, dtype=torch.bool)
+    pos_idx = B + torch.arange(B * C, device=logits.device).view(B, C)
+    pos_mask.scatter_(1, pos_idx, True)
+
+    logits = logits.masked_fill(self_mask, float("-inf"))
     log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-    positives = positive_mask.sum(dim=1)
-    mean_log_prob_pos = (positive_mask * log_prob).sum(dim=1) / torch.clamp(positives, min=1.0)
+    masked_log_prob = torch.where(pos_mask, log_prob, torch.zeros_like(log_prob))
+    pos_count = pos_mask.to(log_prob.dtype).sum(dim=1).clamp(min=1.0)
+    loss_per = -masked_log_prob.sum(dim=1) / pos_count
 
-    valid = positives > 0
     if not torch.any(valid):
-        return z.sum() * 0.0
-    return -mean_log_prob_pos[valid].mean()
+        return z_anchor.sum() * 0.0
+    return loss_per[valid].mean()
 
 
 def vmf_Q_loss(z_batch: torch.Tensor, r_batch: torch.Tensor, mu: torch.Tensor, kappa: float) -> torch.Tensor:
-    """Negative reduced M-step objective for the vMF-mixture channel."""
+    """Negative objective for the vMF-mixture channel."""
 
     z_batch = F.normalize(z_batch, dim=1, eps=1e-12)
     mu = F.normalize(mu, dim=1, eps=1e-12)
@@ -84,15 +102,7 @@ def _build_embedding_loader(
     )
 
 
-def _label_aware_loader(X: np.ndarray, weak_labels: np.ndarray, cfg: CedarConfig) -> DataLoader:
-    steps_per_epoch = max(1, math.ceil(len(weak_labels) / max(1, cfg.batch_size)))
-    sampler = LabelAwareBatchSampler(
-        labels=weak_labels,
-        batch_size=max(2, cfg.batch_size),
-        num_views=2,
-        steps_per_epoch=steps_per_epoch,
-        seed=cfg.seed,
-    )
+def _simple_loader(X: np.ndarray, weak_labels: np.ndarray, cfg: CedarConfig, shuffle: bool = True) -> DataLoader:
     idx_tensor = torch.arange(len(weak_labels), dtype=torch.long)
     dataset = TensorDataset(
         torch.tensor(X, dtype=torch.float32),
@@ -101,10 +111,32 @@ def _label_aware_loader(X: np.ndarray, weak_labels: np.ndarray, cfg: CedarConfig
     )
     return DataLoader(
         dataset,
-        batch_sampler=sampler,
+        batch_size=max(2, cfg.batch_size),
+        shuffle=shuffle,
+        drop_last=False,
         num_workers=cfg.num_workers,
         pin_memory=cfg.num_workers > 0,
     )
+
+
+def _encode_anchor_and_partners(
+    encoder: nn.Module,
+    xb: torch.Tensor,
+    X: np.ndarray,
+    partner_indices: np.ndarray,
+    device: str,
+    num_positives: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Forward anchors and their sampled partners through the encoder in one pass."""
+
+    flat_partner_idx = partner_indices.reshape(-1)
+    partner_x = torch.from_numpy(np.ascontiguousarray(X[flat_partner_idx])).float().to(device)
+    all_x = torch.cat([xb, partner_x], dim=0)
+    all_z = encoder(all_x)
+    batch = xb.shape[0]
+    z_anchor = all_z[:batch]
+    z_partners = all_z[batch:].view(batch, num_positives, -1)
+    return z_anchor, z_partners
 
 
 @torch.no_grad()
@@ -121,29 +153,41 @@ def compute_embeddings(encoder: nn.Module, X: np.ndarray, batch_size: int, devic
     return F.normalize(Z, dim=1, eps=1e-12)
 
 
-def warmup_phase(encoder: nn.Module, X: np.ndarray, weak_labels: np.ndarray, cfg: CedarConfig) -> None:
-    """Warm up the encoder using only the weak-structure objective."""
+def warmup_phase(
+    encoder: nn.Module,
+    X: np.ndarray,
+    weak_labels: np.ndarray,
+    cfg: CedarConfig,
+    sampler: Optional[PositivePairSampler] = None,
+) -> PositivePairSampler:
+    """Warm up the encoder with the partner-pair supervised contrastive objective."""
 
     encoder.to(cfg.device)
-    loader = _label_aware_loader(X, weak_labels, cfg)
+    if sampler is None:
+        sampler = PositivePairSampler(weak_labels, cfg.num_positives, cfg.seed)
+
+    loader = _simple_loader(X, weak_labels, cfg, shuffle=True)
     opt = torch.optim.AdamW(encoder.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     for _ in range(cfg.warmup_epochs):
         encoder.train()
-        for xb, yb, _ in loader:
+        for xb, yb, idxb in loader:
+            partner_idx, valid_np = sampler.sample(idxb.numpy(), yb.numpy())
             xb = xb.to(cfg.device)
-            yb = yb.to(cfg.device)
+            valid = torch.from_numpy(valid_np).to(cfg.device)
+
             opt.zero_grad(set_to_none=True)
-            z = encoder(xb)
-            loss = weak_structure_loss(z, yb, cfg.tau_weak)
+            z_anchor, z_partners = _encode_anchor_and_partners(
+                encoder, xb, X, partner_idx, cfg.device, cfg.num_positives,
+            )
+            loss = pair_supcon_loss(z_anchor, z_partners, valid, cfg.tau_weak)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(encoder.parameters(), cfg.max_grad_norm)
             opt.step()
+    return sampler
 
 
 def _spherical_kmeanspp_init(Z: torch.Tensor, k: int) -> torch.Tensor:
-    """k-means++ initialization on the unit sphere using cosine distance."""
-
     if Z.shape[0] < k:
         raise ValueError(f"Need at least k={k} samples for initialization")
 
@@ -167,7 +211,6 @@ def _spherical_kmeanspp_init(Z: torch.Tensor, k: int) -> torch.Tensor:
 
 
 def _spherical_lloyd_refine(Z: torch.Tensor, mu: torch.Tensor, steps: int = 3) -> torch.Tensor:
-    """Run a few Lloyd steps to spread prototypes before CEDAR."""
 
     if steps <= 0:
         return F.normalize(mu, dim=1, eps=1e-12)
@@ -203,7 +246,6 @@ def _init_score(Z: torch.Tensor, mu: torch.Tensor, kappa: float) -> float:
 
 
 def select_init_mu(Z: torch.Tensor, cfg: CedarConfig) -> torch.Tensor:
-    """Pick the best spherical k-means++ initialization over multiple restarts."""
 
     restarts = max(1, int(cfg.init_restarts))
     best_mu = None
@@ -246,39 +288,25 @@ def update_mu(
     cfg: CedarConfig,
     mu_prev: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Update prototypes and optionally reseed low-mass components."""
+    """Update vMF prototypes from soft responsibilities.
 
+    Components whose weighted-sum direction has effectively zero norm retain
+    their previous ``mu_prev`` row when one is supplied.
+    """
+
+    del cfg
     Z = F.normalize(Z, dim=1, eps=1e-12)
     weighted_mu = torch.matmul(r_all.T, Z)
     mu = F.normalize(weighted_mu, dim=1, eps=1e-12)
+
+    if mu_prev is not None:
+        bad = weighted_mu.norm(dim=1) < 1e-12
+        if torch.any(bad):
+            mu_prev_n = F.normalize(mu_prev, dim=1, eps=1e-12)
+            mu = torch.where(bad.unsqueeze(1), mu_prev_n, mu)
+
     expected_counts = r_all.sum(dim=0)
-
-    reseeded = 0
-    if cfg.reseed_low_mass:
-        low_mass = expected_counts < cfg.min_expected_count
-        if low_mass.any():
-            live_mask = ~low_mass
-            if live_mask.any():
-                live_mu = mu[live_mask]
-                coverage = torch.matmul(Z, live_mu.T).max(dim=1).values
-            elif mu_prev is not None:
-                coverage = torch.matmul(Z, F.normalize(mu_prev, dim=1, eps=1e-12).T).max(dim=1).values
-            else:
-                coverage = torch.zeros(Z.shape[0], device=Z.device, dtype=Z.dtype)
-
-            candidate_order = torch.argsort(coverage, descending=False)
-            used_candidates = set()
-            for cluster_idx in torch.nonzero(low_mass, as_tuple=False).view(-1).tolist():
-                for candidate_idx in candidate_order.tolist():
-                    if candidate_idx not in used_candidates:
-                        mu[cluster_idx] = Z[candidate_idx]
-                        used_candidates.add(candidate_idx)
-                        reseeded += 1
-                        break
-
-    mu = F.normalize(mu, dim=1, eps=1e-12)
     stats = {
-        "reseeded_components": float(reseeded),
         "min_expected_count": float(expected_counts.min().item()),
         "max_expected_count": float(expected_counts.max().item()),
     }
@@ -312,10 +340,6 @@ def fit_vmf_mixture_fixed_embeddings(
             pi = torch.clamp(pi, min=cfg.min_component_weight)
             pi = pi / pi.sum().clamp_min(1e-12)
             mu, mu_stats = update_mu(Z, r_all, cfg, mu_prev=mu)
-            if int(mu_stats["reseeded_components"]) > 0:
-                r_all, pi = e_step_vmf(Z, mu, pi, cfg.kappa, cfg.pi_smoothing)
-                pi = torch.clamp(pi, min=cfg.min_component_weight)
-                pi = pi / pi.sum().clamp_min(1e-12)
 
             mean_q = float((r_all * (cfg.kappa * torch.matmul(Z, mu.T))).sum(dim=1).mean().item())
             diag = cluster_diagnostics(pi, r_all=r_all)
@@ -329,13 +353,12 @@ def fit_vmf_mixture_fixed_embeddings(
             )
             print(
                 "[vMF-fixed {iter}] mean_Q={mean_q:.4f} eff_k={eff:.2f} "
-                "pi_min={pi_min:.4g} pi_max={pi_max:.4g} reseeded={reseeded:.0f}".format(
+                "pi_min={pi_min:.4g} pi_max={pi_max:.4g}".format(
                     iter=em_iter,
                     mean_q=mean_q,
                     eff=diag["effective_clusters"],
                     pi_min=diag["pi_min"],
                     pi_max=diag["pi_max"],
-                    reseeded=mu_stats["reseeded_components"],
                 )
             )
 
@@ -362,8 +385,9 @@ def composite_cedar_training_phase(
     device = cfg.device
     encoder.to(device)
 
+    sampler = PositivePairSampler(weak_labels, cfg.num_positives, cfg.seed)
     if not skip_warmup:
-        warmup_phase(encoder, X, weak_labels, cfg)
+        warmup_phase(encoder, X, weak_labels, cfg, sampler=sampler)
 
     with torch.no_grad():
         Z_full = compute_embeddings(encoder, X, cfg.batch_size, device)
@@ -371,7 +395,7 @@ def composite_cedar_training_phase(
         mu = select_init_mu(Z_full, cfg)
     pi = torch.full((cfg.num_clusters,), 1.0 / cfg.num_clusters, device=device)
 
-    loader = _label_aware_loader(X, weak_labels, cfg)
+    loader = _simple_loader(X, weak_labels, cfg, shuffle=True)
     history: List[Dict[str, float]] = []
     best_snapshot = {
         "loss": float("inf"),
@@ -388,10 +412,6 @@ def composite_cedar_training_phase(
             pi = torch.clamp(pi, min=cfg.min_component_weight)
             pi = pi / pi.sum().clamp_min(1e-12)
             mu, mu_stats = update_mu(Z_full, r_all, cfg, mu_prev=mu)
-            if int(mu_stats["reseeded_components"]) > 0:
-                r_all, pi = e_step_vmf(Z_full, mu, pi, cfg.kappa, cfg.pi_smoothing)
-                pi = torch.clamp(pi, min=cfg.min_component_weight)
-                pi = pi / pi.sum().clamp_min(1e-12)
 
             mean_q = float((r_all * (cfg.kappa * torch.matmul(Z_full, mu.T))).sum(dim=1).mean().item())
             diag = cluster_diagnostics(pi, r_all=r_all)
@@ -404,13 +424,12 @@ def composite_cedar_training_phase(
             history.append(iter_stats)
             print(
                 "[CEDAR {iter}] mean_Q={mean_q:.4f} eff_k={eff:.2f} "
-                "pi_min={pi_min:.4g} pi_max={pi_max:.4g} reseeded={reseeded:.0f}".format(
+                "pi_min={pi_min:.4g} pi_max={pi_max:.4g}".format(
                     iter=em_iter,
                     mean_q=mean_q,
                     eff=diag["effective_clusters"],
                     pi_min=diag["pi_min"],
                     pi_max=diag["pi_max"],
-                    reseeded=mu_stats["reseeded_components"],
                 )
             )
 
@@ -423,15 +442,18 @@ def composite_cedar_training_phase(
             batches = 0
 
             for xb, yb, idxb in loader:
+                partner_idx, valid_np = sampler.sample(idxb.numpy(), yb.numpy())
                 xb = xb.to(device)
-                yb = yb.to(device)
-                idxb = idxb.to(device)
+                idxb_dev = idxb.to(device)
+                valid = torch.from_numpy(valid_np).to(device)
 
                 opt.zero_grad(set_to_none=True)
-                z = encoder(xb)
-                r_batch = r_all[idxb].detach()
-                mix_loss = vmf_Q_loss(z, r_batch, mu, cfg.kappa)
-                weak_loss = weak_structure_loss(z, yb, cfg.tau_weak)
+                z_anchor, z_partners = _encode_anchor_and_partners(
+                    encoder, xb, X, partner_idx, device, cfg.num_positives,
+                )
+                r_batch = r_all[idxb_dev].detach()
+                mix_loss = vmf_Q_loss(z_anchor, r_batch, mu, cfg.kappa)
+                weak_loss = pair_supcon_loss(z_anchor, z_partners, valid, cfg.tau_weak)
                 total_loss = mix_loss + cfg.lambda_weak * weak_loss
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(encoder.parameters(), cfg.max_grad_norm)

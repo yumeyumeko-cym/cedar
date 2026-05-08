@@ -35,8 +35,9 @@ class CedarConfig:
     # Anti-collapse safeguards
     pi_smoothing: float = 0.01
     min_component_weight: float = 1e-3
-    min_expected_count: float = 8.0
-    reseed_low_mass: bool = True
+
+    # Supervised-alike contrastive (positives sampled from same-edge flows in dataset)
+    num_positives: int = 1
 
     # Data
     batch_size: int = 512

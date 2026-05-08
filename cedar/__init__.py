@@ -8,7 +8,7 @@ from .data import (
     load_and_sample_data,
     resolve_data_dir,
 )
-from .model import CedarEncoder, LabelAwareBatchSampler
+from .model import CedarEncoder, PositivePairSampler
 from .scoring import (
     cluster_diagnostics,
     compute_f1_at_percentile,
@@ -21,12 +21,12 @@ from .training import (
     compute_embeddings,
     e_step_vmf,
     fit_vmf_mixture_fixed_embeddings,
+    pair_supcon_loss,
     select_init_mu,
     set_seed,
     update_mu,
     vmf_Q_loss,
     warmup_phase,
-    weak_structure_loss,
 )
 
 __all__ = [
@@ -34,7 +34,7 @@ __all__ = [
     "CedarEncoder",
     "DATASET_DEFAULT_DIRS",
     "DataBundle",
-    "LabelAwareBatchSampler",
+    "PositivePairSampler",
     "SUPPORTED_DATASETS",
     "cluster_diagnostics",
     "composite_cedar_training_phase",
@@ -45,6 +45,7 @@ __all__ = [
     "e_step_vmf",
     "fit_vmf_mixture_fixed_embeddings",
     "load_and_sample_data",
+    "pair_supcon_loss",
     "resolve_data_dir",
     "score_samples_vmf",
     "select_init_mu",
@@ -52,5 +53,4 @@ __all__ = [
     "update_mu",
     "vmf_Q_loss",
     "warmup_phase",
-    "weak_structure_loss",
 ]

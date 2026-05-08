@@ -81,8 +81,7 @@ def _build_cfg(
         init_restarts=args.init_restarts,
         pi_smoothing=args.pi_smoothing,
         min_component_weight=args.min_component_weight,
-        min_expected_count=args.min_expected_count,
-        reseed_low_mass=not args.disable_reseed,
+        num_positives=args.num_positives,
         batch_size=batch_size,
         num_workers=args.num_workers,
         device=device,
@@ -216,7 +215,6 @@ def evaluate_run(
             "effective_clusters",
             "min_expected_count",
             "max_expected_count",
-            "reseeded_components",
         ):
             if key in final_diag:
                 row[f"final_{key}"] = final_diag[key]
@@ -376,10 +374,10 @@ def parse_arguments():
     parser.add_argument("--kappa_list", type=float, nargs="+", default=[50.0], help="vMF concentration values")
     parser.add_argument("--init_restarts", type=int, default=1, help="Number of prototype init restarts")
 
+    parser.add_argument("--num_positives", type=int, default=1, help="Number of same-edge positive partners sampled per anchor")
+
     parser.add_argument("--pi_smoothing", type=float, default=0.01, help="Uniform smoothing added to mixing weights")
     parser.add_argument("--min_component_weight", type=float, default=1e-3, help="Floor applied to component weights")
-    parser.add_argument("--min_expected_count", type=float, default=8.0, help="Reseed components below this soft count")
-    parser.add_argument("--disable_reseed", action="store_true", help="Disable low-mass component reseeding")
 
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", help="Device override: auto|cpu|cuda")
