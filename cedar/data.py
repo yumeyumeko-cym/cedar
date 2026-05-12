@@ -6,7 +6,15 @@ import os
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+
+
+def _arrow_string_mapper(arrow_type):
+	if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+		return pd.StringDtype("pyarrow")
+	return None
 
 
 @dataclass
@@ -228,20 +236,17 @@ def _load_nf_unsw_data(data_dir: str, cut_off: float, seed: int) -> DataBundle:
 
 def _load_cicids2018_data(data_dir: str, cut_off: float, seed: int) -> DataBundle:
 	merged_path = os.path.join(data_dir, "merged_df.parquet")
-	merged_df = pd.read_parquet(merged_path)
+	# Avoid the giant object-array allocation pandas does for string columns
+	# on 20M-row CICIDS2018: keep strings in Arrow's compact buffer format.
+	table = pq.read_table(merged_path)
+	merged_df = table.to_pandas(types_mapper=_arrow_string_mapper)
+	del table
 
-	# CICIDS2018 is much sparser under src->dst labels, so use a service-aware edge
-	# and a less aggressive early-time window.
-	merged_df["Edge"] = (
-		merged_df["Destination IP"].astype(str)
-		+ "|"
-		+ merged_df["Destination Port"].astype(str)
-		+ "|"
-		+ merged_df["PROTOCOL"].astype(str)
-	)
-	time_split = float(merged_df["Timestamp"].quantile(0.20))
+	if "Edge" not in merged_df.columns:
+		merged_df["Edge"] = merged_df["Source IP"] + "->" + merged_df["Destination IP"]
+	time_split = 144
 
-	data1 = merged_df[merged_df["Timestamp"] <= time_split].copy()
+	data1 = merged_df[merged_df["Timestamp"] <= time_split]
 	benign_df = data1.groupby("Edge").filter(lambda df: df["Label"].max() == 0).copy()
 	max_ts = benign_df["Timestamp"].max()
 	cutoff_ts = cut_off * max_ts
@@ -258,8 +263,8 @@ def _load_cicids2018_data(data_dir: str, cut_off: float, seed: int) -> DataBundl
 		"Destination Port",
 		"Timestamp",
 		"FLOW_END_MILLISECONDS",
-		"DNS_QUERY_ID",
-		"FTP_COMMAND_RET_CODE",
+		"DNS_QUERY_ID",  # Noise
+		"FTP_COMMAND_RET_CODE",  # Only meaningful for FTP traffic
 		"Label",
 		"Attack",
 		"Edge",
@@ -276,7 +281,7 @@ def _load_cicids2018_data(data_dir: str, cut_off: float, seed: int) -> DataBundl
 		"ICMP_IPV4_TYPE",
 	]
 
-	columns_numeric = [col for col in merged_df.columns if col not in columns_text + columns_cat]
+	columns_numeric = [col for col in merged_df.columns if col not in columns_text+columns_cat]
 
 	X_benign_numeric = benign_df[columns_numeric].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 	scaler = MinMaxScaler()
